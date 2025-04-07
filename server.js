@@ -2,13 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import pool from './db.js';
 import http from 'http';
-import exceljs from "exceljs";
-import { Server } from 'socket.io';
-import { createServer } from 'http';
 
-const now = new Date();
-const formattedDate = now.toISOString().split('T')[0];
-const filename = `Incident_Report_${formattedDate}.xlsx`;
+import { Server } from 'socket.io';
 
 const app = express();
 const server = http.createServer(app);
@@ -21,7 +16,7 @@ const io = new Server(server, {
 app.use(express.json());
 app.use(cors());
 
-// 🛠 FETCH MYSQL DATA TO EXCEL
+
 
 // 🛠 LOGIN API STOC
 app.post('/api/login', async (req, res) => {
@@ -71,16 +66,28 @@ app.post('/api/login2', async (req, res) => {
     }
 });
 
-// 🛠 REGISTER A STORE ACCOUNT
+//REGISTER STORE    
 app.post('/api/register', async (req, res) => {
-    const { username, password, store_name, store_location, store_contact } = req.body;
+    const { username, password, store_name, store_location, store_contact, store_address } = req.body;
 
     try {
-        // 🛠 Insert new account into STORE_ACCOUNTS table
+        const [existingStore] = await pool.execute(
+            `SELECT * FROM STORE_ACCOUNTS 
+             WHERE LOWER(username) = LOWER(?) 
+             AND LOWER(store_name) = LOWER(?) 
+             AND LOWER(store_address) = LOWER(?)`,
+            [username, store_name, store_address]
+        );
+
+        if (existingStore.length > 0) {
+            return res.status(400).json({ message: 'Store with the same username, store name, and store address already exists!' });
+        }
+
+        // 🛠 Insert new account if no duplicate
         await pool.execute(
-            `INSERT INTO STORE_ACCOUNTS (username, password, store_name, store_location, store_contact)
-             VALUES (?, ?, ?, ?, ?)`,
-            [username, password, store_name, store_location, store_contact]
+            `INSERT INTO STORE_ACCOUNTS (username, password, store_name, store_location, store_contact, store_address)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [username, password, store_name, store_location, store_contact, store_address]
         );
 
         res.status(201).json({ message: 'Account registered successfully!' });
@@ -92,9 +99,9 @@ app.post('/api/register', async (req, res) => {
 
 // 🛠 REGISTER A POLICE ACCOUNT
 app.post("/register-police", async (req, res) => {
-    const { username, password, stoc_contact, stoc_email } = req.body;
+    const { username, password, stoc_contact, stoc_email, stoc_location } = req.body;
 
-    if (!username || !password || !stoc_contact || !stoc_email) {
+    if (!username || !password || !stoc_contact || !stoc_email || !stoc_location) {
         return res.status(400).json({ error: "All fields are required." });
     }
 
@@ -109,8 +116,8 @@ app.post("/register-police", async (req, res) => {
         }
 
         await pool.query(
-            "INSERT INTO STOC_ACCOUNTS (username, password, stoc_contact, stoc_email) VALUES (?, ?, ?, ?)",
-            [username, password, stoc_contact, stoc_email]
+            "INSERT INTO STOC_ACCOUNTS (username, password, stoc_contact, stoc_email, stoc_location) VALUES (?, ?, ?, ?, ?)",
+            [username, password, stoc_contact, stoc_email, stoc_location]
         );
 
         res.status(201).json({ message: "Police account registered successfully!" });
@@ -122,117 +129,173 @@ app.post("/register-police", async (req, res) => {
 
 // 🛠 GET STOC INCIDENT HISTORY
 app.get('/api/detection-history', async (req, res) => {
-    const { search } = req.query; 
-    console.log('Received search query:', search);
-
+    const { search, searchLocations, searchThreatLevels, searchType } = req.query;
+    
     try {
-        let query = 'SELECT * FROM STOC_DETECTION_HISTORY';
+        let query = 'SELECT * FROM STOC_DETECTION_HISTORY WHERE 1=1'; 
         const params = [];
 
+        // ✅ Search Filter
         if (search) {
-            query += ' WHERE store_name LIKE ? OR location LIKE ? OR store_contact LIKE ? OR threat_level LIKE ? OR detection_type LIKE ? OR shared_detection_id ?';
-            const searchTerm = `%${search}%`; 
+            query += ` AND (store_name LIKE ? OR store_location LIKE ? OR store_contact LIKE ? OR 
+                             threat_level LIKE ? OR detection_type LIKE ? OR shared_detection_id LIKE ?)`;
+            const searchTerm = `%${search}%`;
             params.push(searchTerm, searchTerm, searchTerm, searchTerm, searchTerm, searchTerm);
         }
 
-        console.log('Executing query:', query, 'with params:', params); 
+        // ✅ Location Filter
+        if (searchLocations) {
+            const locationsArray = searchLocations.split(",");
+            query += ` AND store_location IN (${locationsArray.map(() => "?").join(",")})`;
+            params.push(...locationsArray);
+        }
+
+        // ✅ Threat Level Filter
+        if (searchThreatLevels) {
+            const threatArray = searchThreatLevels.split(",");
+            query += ` AND threat_level IN (${threatArray.map(() => "?").join(",")})`;
+            params.push(...threatArray);
+        }
+
+        // ✅ Type Filter
+        if (searchType) {
+            const typeArray = searchType.split(",");
+            query += ` AND detection_type IN (${typeArray.map(() => "?").join(",")})`;
+            params.push(...typeArray);
+        }
+
+        console.log("Executing query:", query, "with params:", params); 
 
         const [results] = await pool.execute(query, params);
         res.json(results);
     } catch (error) {
-        console.error('Database error:', error);
-        res.status(500).json({ message: 'Error retrieving history' });
+        console.error("Database error:", error);
+        res.status(500).json({ message: "Error retrieving history" });
     }
 });
 
-// 🛠 GET REPORT COUNT FOR LAST 4 MONTHS (BAR GRAPH)
-app.get('/api/reports-per-month', async (req, res) => {
+// ✅ GET REPORT COUNT BY MONTH (Bar Chart)
+app.get('/api/reports-by-month', async (req, res) => {
     try {
-        const lastFourMonths = [];
-        const currentDate = new Date();
-
-        // Generate the last 4 months dynamically
-        for (let i = 3; i >= 0; i--) {
-            const targetMonth = new Date(currentDate.getFullYear(), currentDate.getMonth() - i, 1);
-            lastFourMonths.push({
-                monthNumber: targetMonth.getMonth() + 1, // 1-based month number
-                monthName: targetMonth.toLocaleString("default", { month: "short" }), // "Jan", "Feb", etc.
-                count: 0
-            });
-        }
-
-        // Query the database for report counts in the last 4 months
         const query = `
-            SELECT MONTH(date) AS monthNumber, COUNT(*) AS count
+            SELECT DATE_FORMAT(date, '%M') AS monthName,
+                   MONTH(date) AS monthNumber,
+                   COUNT(*) AS count
             FROM STOC_DETECTION_HISTORY
-            WHERE date >= DATE_SUB(CURDATE(), INTERVAL 4 MONTH)
-            GROUP BY MONTH(date)
-            ORDER BY MONTH(date);
+            WHERE YEAR(date) = YEAR(CURDATE())
+            GROUP BY monthName, monthNumber
+            ORDER BY monthNumber;
         `;
         const [rows] = await pool.execute(query);
-
-        // Merge database results into lastFourMonths array
-        lastFourMonths.forEach(month => {
-            const found = rows.find(row => row.monthNumber === month.monthNumber);
-            if (found) month.count = found.count;
-        });
-
-        res.json(lastFourMonths);
-    } catch (error) {
-        console.error("❌ Error fetching monthly reports:", error);
-        res.status(500).json({ error: "Internal server error", details: error.message });
+        res.json(rows);
+    } catch (err) {
+        console.error("❌ Error fetching reports by month:", err);
+        res.status(500).json({ error: "Internal Server Error" });
     }
 });
 
-// 🛠 GET REPORT COUNT BY LOCATION (FOR PIE CHART)
+// ✅ GET REPORT COUNT BY LOCATION (Pie Chart)
 app.get('/api/reports-by-location', async (req, res) => {
     try {
         const query = `
-            SELECT store_location, COUNT(*) AS count
+            SELECT store_location AS name, COUNT(*) AS value
             FROM STOC_DETECTION_HISTORY
+            WHERE YEAR(date) = YEAR(CURDATE())
             GROUP BY store_location
+            ORDER BY value DESC;
         `;
-        const [results] = await pool.query(query);
-
-        if (!results.length) {
-            return res.status(404).json({ message: "No data found" });
-        }
-
-        const locationData = results.map(row => ({
-            name: row.store_location,
-            value: row.count
-        }));
-
-        res.json(locationData);
-    } catch (error) {
-        console.error("❌ Error fetching location data:", error);
-        res.status(500).json({ error: "Internal Server Error", details: error.message });
+        const [rows] = await pool.execute(query);
+        res.json(rows);
+    } catch (err) {
+        console.error("❌ Error fetching reports by location:", err);
+        res.status(500).json({ error: "Internal Server Error" });
     }
 });
 
 // 🛠 STORE INCIDENT HISTORY
 app.get('/api/incident-history/:storeID', async (req, res) => {
-    const { storeID } = req.params; 
-    const { search } = req.query; 
+    const { storeID } = req.params;
+    const { search } = req.query;
 
     try {
-        let query = `SELECT * FROM STORE_DETECTION_HISTORY WHERE store_ID = ?`;
+        let query = `SELECT * FROM STORE_DETECTION_HISTORY WHERE store_ID = ? AND threat_level != 'Low'`;  // Exclude 'Low' threat level
         const params = [storeID];
 
         if (search) {
             query += ' AND (date LIKE ? OR time LIKE ? OR threat_level LIKE ? OR detection_type LIKE ? OR shared_detection_id LIKE ?)';
-            const searchTerm = `%${search}%`; 
+            const searchTerm = `%${search}%`;
             params.push(searchTerm, searchTerm, searchTerm, searchTerm, searchTerm);
         }
 
-        console.log('Executing query:', query, 'with params:', params); 
+        console.log('Executing query:', query, 'with params:', params);
 
         const [rows] = await pool.execute(query, params);
         res.json(rows);
-
     } catch (error) {
-        console.error('Error fetching incident history:', error); 
+        console.error('Error fetching incident history:', error);
         res.status(500).json({ error: 'Internal server error', details: error.message });
+    }
+});
+
+// 🛠 EDIT STORE INCIDENT RECORD
+app.put('/api/edit-incident/:id', async (req, res) => {
+    const { id } = req.params;
+    const { date, time, threat_level, detection_type } = req.body;
+
+    try {
+        console.log(`📝 Edit Request for detection_ID=${id}`);
+
+        // ✅ Check if the record exists in STORE_DETECTION_HISTORY
+        const [existingRecord] = await pool.query('SELECT * FROM STORE_DETECTION_HISTORY WHERE detection_ID = ?', [id]);
+        if (existingRecord.length === 0) {
+            console.log(`❌ No record found with detection_ID=${id}`);
+            return res.status(404).json({ message: "Incident not found." });
+        }
+
+        console.log("✅ Found Record:", existingRecord[0]);
+
+        // ✅ Update the record
+        const updateQuery = `
+            UPDATE STORE_DETECTION_HISTORY 
+            SET date = ?, time = ?, threat_level = ?, detection_type = ? 
+            WHERE detection_ID = ?
+        `;
+        const [updateResult] = await pool.query(updateQuery, [date, time, threat_level, detection_type, id]);
+
+        if (updateResult.affectedRows === 0) {
+            console.log(`⚠️ No changes made to detection_ID=${id}`);
+            return res.status(400).json({ message: "No changes made to the record." });
+        }
+
+        console.log(`✅ detection_ID=${id} updated successfully.`);
+
+        // ✅ Log changes in STORE_EDIT_HISTORY
+        const currentDate = new Date();
+        const dateEdited = currentDate.toISOString().split('T')[0]; // YYYY-MM-DD
+        const timeEdited = currentDate.toTimeString().split(' ')[0]; // HH:MM:SS
+
+        const insertHistoryQuery = `
+            INSERT INTO STORE_EDIT_HISTORY (detection_ID, date, time, threat_level, detection_type, date_edited, time_edited)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        `;
+        await pool.query(insertHistoryQuery, [id, existingRecord[0].date, existingRecord[0].time, existingRecord[0].threat_level, existingRecord[0].detection_type, dateEdited, timeEdited]);
+
+        res.json({ message: "Incident updated successfully and logged!", affectedRows: updateResult.affectedRows });
+    } catch (error) {
+        console.error("❌ Error updating incident:", error);
+        res.status(500).json({ message: "Internal server error", error: error.message });
+    }
+});
+
+//EDITED ROWS HISTORY RECORD STORE
+app.get('/api/edit-history', async (req, res) => {
+    try {
+        const query = 'SELECT * FROM STORE_EDIT_HISTORY ORDER BY date_edited DESC, time_edited DESC';
+        const [results] = await pool.query(query);
+        res.json(results);
+    } catch (error) {
+        console.error('❌ Error fetching edit history:', error);
+        res.status(500).json({ message: 'Internal server error', error: error.message });
     }
 });
 
@@ -415,8 +478,8 @@ app.delete('/api/delete-detection/:id', async (req, res) => {
 
         const { store_ID, date, time } = result[0];
         const currentDate = new Date();
-        const dateDeleted = currentDate.toISOString().split('T')[0]; 
-        const timeDeleted = currentDate.toTimeString().split(' ')[0];
+        const dateDeleted = currentDate.toISOString().split('T')[0];  
+        const timeDeleted = currentDate.toTimeString().split(' ')[0]; 
 
         const insertQuery = `
             INSERT INTO STOC_EDIT_HISTORY (date_deleted, time_deleted, detection_ID, date, time, store_ID)
@@ -433,48 +496,45 @@ app.delete('/api/delete-detection/:id', async (req, res) => {
 });
 
 // 🛠 LOG DELETE STORE INCIDENT RECORD
-app.get('/api/deleted-history2/:storeID', async (req, res) => {
-    const { storeID } = req.params;
-
+app.get('/api/delete-history-store', async (req, res) => {
     try {
-        const query = 'SELECT * FROM STORE_DELETE_HISTORY WHERE store_ID = ? ORDER BY date_deleted DESC, time_deleted DESC';
-        const [results] = await pool.query(query, [storeID]);
+        const query = 'SELECT * FROM STORE_DELETE_HISTORY ORDER BY date_deleted DESC, time_deleted DESC';
+        const [results] = await pool.query(query);
         res.json(results);
     } catch (error) {
         console.error('Error fetching delete history:', error);
-        res.status(500).json({ message: 'Database error', error: error.message });
+        res.status(500).json({ message: 'Internal server error', error: error.message });
     }
 });
 
 // 🛠 DELETE STORE INCIDENT RECORD
-app.delete('/api/delete-detection2/:storeID/:detectionID', async (req, res) => {
-    const { storeID, detectionID } = req.params.id;
+app.delete('/api/delete-detection-store/:id', async (req, res) => {
+    const detectionId = req.params.id;
 
     try {
-        const query = 'SELECT * FROM STORE_DETECTION_HISTORY WHERE detection_ID = ? AND store_ID = ?';
-        const [result] = await pool.query(query, [detectionID, storeID]);
+        const query = 'SELECT * FROM STORE_DETECTION_HISTORY WHERE detection_ID = ?';
+        const [result] = await pool.query(query, [detectionId]);
 
         if (result.length === 0) {
             return res.status(404).json({ message: 'Record not found' });
         }
 
-        // Log deletion
-        const { storeID, date, time } = result[0];
+        const { store_ID, date, time } = result[0];
         const currentDate = new Date();
-        const dateDeleted = currentDate.toISOString().split('T')[0];
-        const timeDeleted = currentDate.toTimeString().split(' ')[0];
+        const dateDeleted = currentDate.toISOString().split('T')[0];  
+        const timeDeleted = currentDate.toTimeString().split(' ')[0]; 
 
         const insertQuery = `
             INSERT INTO STORE_DELETE_HISTORY (date_deleted, time_deleted, detection_ID, date, time, store_ID)
             VALUES (?, ?, ?, ?, ?, ?)`;
-        await pool.query(insertQuery, [dateDeleted, timeDeleted, detectionID, date, time, storeID]);
-        
-        const deleteQuery = 'DELETE FROM STORE_DETECTION_HISTORY WHERE detection_ID = ? AND store_ID = ?';
-        await pool.query(deleteQuery, [detectionID, storeID]);
+        await pool.query(insertQuery, [dateDeleted, timeDeleted, detectionId, date, time, store_ID]);
+
+        const deleteQuery = 'DELETE FROM STORE_DETECTION_HISTORY WHERE detection_ID = ?';
+        await pool.query(deleteQuery, [detectionId]);
 
         res.json({ message: 'Record deleted successfully' });
     } catch (error) {
-        res.status(500).json({ message: 'Database error', error: error.message });
+        res.status(500).json({ message: 'Internal server error', error: error.message });
     }
 });
 
@@ -483,7 +543,7 @@ const deleteOldRecords = async () => {
     try {
         const query = `
             DELETE FROM STOC_EDIT_HISTORY 
-            WHERE date_deleted < DATE_SUB(NOW(), INTERVAL 2 DAY)
+            WHERE date_deleted < DATE_SUB(NOW(), INTERVAL 3 DAY)
         `;
         const [result] = await pool.query(query);
         console.log(`Auto-deleted ${result.affectedRows} records from STOC_EDIT_HISTORY`);
@@ -494,84 +554,110 @@ const deleteOldRecords = async () => {
     setInterval(deleteOldRecords, 24 * 60 * 60 * 1000);
     deleteOldRecords();
 
-// 🛠 PERMANENT DELETION
-app.post('/api/delete-permanent', async (req, res) => {
-    const { password, detection_ID } = req.body;
-
-    if (!password || !detection_ID) {
-        return res.status(400).json({ message: 'Password and detection ID are required' });
-    }
-
+//AUTODELETE FUNCTION
+const deleteOldRecordsStore = async () => {
     try {
-        // Check if the password exists in STOC_ACCOUNTS
-        const [results] = await pool.execute(
-            'SELECT * FROM STOC_ACCOUNTS WHERE password = ? LIMIT 1',
-            [password]
-        );
-
-        if (results.length === 0) {
-            return res.status(401).json({ message: 'Invalid password' });
-        }
-
-        // Perform the permanent delete operation
-        const [deleteResult] = await pool.execute(
-            'DELETE FROM STOC_EDIT_HISTORY WHERE detection_ID = ?',
-            [detection_ID]
-        );
-
-        if (deleteResult.affectedRows > 0) {
-            res.json({ message: 'Delete Success!' });
-        } else {
-            res.status(404).json({ message: 'Detection record not found' });
-        }
+        const query = `
+            DELETE FROM STORE_DELETE_HISTORY 
+            WHERE date_deleted < DATE_SUB(NOW(), INTERVAL 3 DAY)
+        `;
+        const [result] = await pool.query(query);
+        console.log(`Auto-deleted ${result.affectedRows} records from STORE_DELETE_HISTORY`);
     } catch (error) {
-        console.error('Database error:', error);
-        res.status(500).json({ message: 'Database error', error: error.message });
+        console.error("Error deleting old records:", error);
+    }
+};
+    setInterval(deleteOldRecords, 24 * 60 * 60 * 1000);
+    deleteOldRecords();
+
+// CLEAR TABLE STORE DELETE HISTORY
+app.delete('/api/clear-delete-history', async (req, res) => {
+    try {
+        const deleteQuery = 'DELETE FROM STORE_DELETE_HISTORY';
+        await pool.query(deleteQuery);
+
+        res.json({ message: 'All deleted incident history records have been permanently removed.' });
+    } catch (error) {
+        console.error('Error clearing delete history:', error);
+        res.status(500).json({ message: 'Failed to clear delete history.', error: error.message });
     }
 });
 
-//EXPORT TO EXCEL
-app.get("/api/export-excel", async (req, res) => {
+// CLEAR TABLE STORE DELETE HISTORY
+app.delete('/api/clear-delete-history2', async (req, res) => {
     try {
-        const [rows] = await pool.query("SELECT * FROM STOC_DETECTION_HISTORY");
+        const deleteQuery = 'DELETE FROM STOC_EDIT_HISTORY';
+        await pool.query(deleteQuery);
 
-        if (rows.length === 0) {
-            return res.status(404).json({ message: "No records found" });
+        res.json({ message: 'All deleted incident history records have been permanently removed.' });
+    } catch (error) {
+        console.error('Error clearing delete history:', error);
+        res.status(500).json({ message: 'Failed to clear delete history.', error: error.message });
+    }
+});
+
+// ✅ API to Fetch Incident Report (STOC) with Filters
+app.get('/api/incident-history', async (req, res) => {
+    try {
+        const { searchLocations, searchThreatLevels, searchType } = req.query;
+
+        let query = "SELECT * FROM STOC_DETECTION_HISTORY WHERE 1=1";
+        let queryParams = [];
+
+        if (searchLocations) {
+            const locationsArray = searchLocations.split(",");
+            query += ` AND store_location IN (${locationsArray.map(() => "?").join(",")})`;
+            queryParams.push(...locationsArray);
         }
 
-        const workbook = new exceljs.Workbook();
-        const worksheet = workbook.addWorksheet("Incident History");
+        if (searchThreatLevels) {
+            const threatArray = searchThreatLevels.split(",");
+            query += ` AND threat_level IN (${threatArray.map(() => "?").join(",")})`;
+            queryParams.push(...threatArray);
+        }
 
-        worksheet.columns = [
-            { header: "ID", key: "shared_detection_id", width: 10 },
-            { header: "Store ID", key: "store_ID", width: 15 },
-            { header: "Store Name", key: "store_name", width: 20 },
-            { header: "Location", key: "store_location", width: 20 },
-            { header: "Contact", key: "store_contact", width: 15 },
-            { header: "Date", key: "date", width: 15 },
-            { header: "Time", key: "time", width: 15 },
-            { header: "Threat Level", key: "threat_level", width: 15 },
-            { header: "Type", key: "detection_type", width: 15 }
-        ];
+        if (searchType) {
+            const typeArray = searchType.split(",");
+            query += ` AND detection_type IN (${typeArray.map(() => "?").join(",")})`;
+            queryParams.push(...typeArray);
+        }
 
-        rows.forEach(row => {
-            worksheet.addRow(row);
-        });
+        const [rows] = await pool.query(query, queryParams);
 
-        res.setHeader(
-            "Content-Type",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        );
-        res.setHeader(
-            "Content-Disposition",
-            "attachment; filename=Incident_Report.xlsx"
-        );
-
-        await workbook.xlsx.write(res);
-        res.end();
+        res.json(rows);
     } catch (error) {
-        console.error("Error exporting to Excel:", error);
-        res.status(500).json({ error: "Internal Server Error" });
+        console.error("Error fetching incident history:", error);
+        res.status(500).json({ message: "Internal Server Error" });
+    }
+});
+
+
+// ✅ API to Fetch Incident Report (STORE) with Filters
+app.get('/api/incident-history', async (req, res) => {
+    try {
+        const { searchLocations, searchThreatLevels, searchType } = req.query;
+
+        let query = "SELECT * FROM STORE_DETECTION_HISTORY WHERE 1=1";
+        let queryParams = [];
+
+        if (searchThreatLevels) {
+            const threatArray = searchThreatLevels.split(",");
+            query += ` AND threat_level IN (${threatArray.map(() => "?").join(",")})`;
+            queryParams.push(...threatArray);
+        }
+
+        if (searchType) {
+            const typeArray = searchType.split(",");
+            query += ` AND detection_type IN (${typeArray.map(() => "?").join(",")})`;
+            queryParams.push(...typeArray);
+        }
+
+        const [rows] = await pool.query(query, queryParams);
+
+        res.json(rows);
+    } catch (error) {
+        console.error("Error fetching incident history:", error);
+        res.status(500).json({ message: "Internal Server Error" });
     }
 });
 
@@ -617,27 +703,31 @@ app.get('/latest-reports2', async (req, res) => {
     }
 });
 
+// WATCHING NEW INCOMING DETECTION (STORE) — Now with filtering for "Cover"
+app.get('/cover-reports/:storeID', async (req, res) => {
+    const { storeID } = req.params;
 
-//NEW INCOMING 1ST WARNING DETECTION (STORE)
-app.get('/api/face-cover-warnings/:storeID', async (req, res) => {
+    const query = `
+        SELECT * FROM STORE_DETECTION_HISTORY
+        WHERE store_ID = ?
+        AND detection_type LIKE '%Cover%'  -- Filter for detection type containing 'Cover'
+        ORDER BY date DESC, time DESC
+        LIMIT 1  -- Adjust number of reports as needed
+    `;
+
     try {
-        const storeID = req.params.storeID;
-
-        if (!storeID) {qqqq
-            return res.status(400).json({ message: "Missing storeID parameter" });
+        const [results] = await pool.query(query, [storeID]);
+        if (results.length === 0) {
+            return res.status(404).json({ message: "No 'Cover' reports found for this store." });
         }
-
-        const [rows] = await pool.execute(
-            'SELECT date, time, store_location FROM STORE_DETECTION_HISTORY WHERE store_ID = ? AND threat_level = ?',
-            [storeID, '1st Warning']
-        );
-
-        res.json(rows);
-    } catch (error) {
-        console.error('Database error:', error);
-        res.status(500).json({ message: 'Database error', error: error.message });
+        console.log(`✅ Cover report(s) retrieved for store ${storeID}:`, results);
+        res.json(results);
+    } catch (err) {
+        console.error("❌ Database Query Error:", err.message);
+        res.status(500).json({ error: `Database query failed: ${err.message}` });
     }
 });
+
 
 // Socket.IO: Handle Client Connection
 io.on("connection", (socket) => {

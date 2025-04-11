@@ -682,16 +682,25 @@ app.get('/latest-reports', async (req, res) => {
     }
 });
 
-//WATCHING NEW INCOMING DETECTION (STORE)
+// WATCHING NEW INCOMING DETECTION (STORE)
 app.get('/latest-reports2', async (req, res) => {
+    const { storeID } = req.query;  // Get the storeID from the query string
+
+    // If storeID is not provided, return an error
+    if (!storeID) {
+        return res.status(400).json({ error: "storeID is required" });
+    }
+
+    // Update the query to filter by storeID
     const query = `
         SELECT * FROM STORE_DETECTION_HISTORY
+        WHERE store_id = ?  -- Assuming 'store_id' is the column in the database
         ORDER BY date DESC, time DESC
         LIMIT 2
     `;
 
     try {
-        const [results] = await pool.query(query);
+        const [results] = await pool.query(query, [storeID]);  // Use the storeID in the query
         if (results.length === 0) {
             return res.status(404).json({ message: "No reports found" });
         }
@@ -728,6 +737,72 @@ app.get('/cover-reports/:storeID', async (req, res) => {
     }
 });
 
+// VERIFY ADMIN PASSWORD STOC
+app.post('/api/verify-admin-password', async (req, res) => {
+    const { password } = req.body;
+
+    if (!password) {
+        return res.status(400).json({ valid: false, message: 'Password required' });
+    }
+
+    try {
+        const [rows] = await pool.execute('SELECT * FROM STOC_ACCOUNTS WHERE password = ?', [password]);
+
+        if (rows.length > 0) {
+            res.json({ valid: true });
+        } else {
+            res.status(401).json({ valid: false, message: 'Incorrect password' });
+        }
+    } catch (error) {
+        console.error('Database error:', error);
+        res.status(500).json({ valid: false, message: 'Server error', error: error.message });
+    }
+});
+
+// VERIFY ADMIN PASSWORD STORE
+app.post('/api/verify-admin-password-store', async (req, res) => {
+    const { password } = req.body;
+
+    if (!password) {
+        return res.status(400).json({ valid: false, message: 'Password required' });
+    }
+
+    try {
+        const [rows] = await pool.execute('SELECT * FROM STORE_ACCOUNTS WHERE password = ?', [password]);
+
+        if (rows.length > 0) {
+            res.json({ valid: true });
+        } else {
+            res.status(401).json({ valid: false, message: 'Incorrect password' });
+        }
+    } catch (error) {
+        console.error('Database error:', error);
+        res.status(500).json({ valid: false, message: 'Server error', error: error.message });
+    }
+});
+
+//STORE PROFILE
+app.get('/api/store-profile/:storeID', async (req, res) => {
+    const { storeID } = req.params;
+
+    try {
+        const result = await pool.query(
+            `SELECT store_ID, username, password, store_name, store_location, store_contact, store_address 
+             FROM STORE_ACCOUNTS 
+             WHERE store_ID = $1`,
+            [storeID]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ message: 'Store not found' });
+        }
+
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('Error fetching store:', err.message);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
 
 // Socket.IO: Handle Client Connection
 io.on("connection", (socket) => {
@@ -739,7 +814,7 @@ io.on("connection", (socket) => {
 });
 
 // 🛠 START SERVER
-const PORT = 5001;
+const PORT = process.env.PORT || 5001;
 app.listen(PORT, () => {
     console.log(`✅ Server running on port ${PORT}`);
 });
